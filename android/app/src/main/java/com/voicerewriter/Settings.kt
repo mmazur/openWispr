@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -63,7 +64,11 @@ data class Settings(
      * context, and the review step cost every dictation 2-6s. On restores the old flow.
      */
     val reviewBeforeInsert: Boolean = false,
-    val bubbleOnlyOnFields: Boolean = true, // show the bubble only while a text field is focused (needs accessibility)
+    val bubbleOnlyOnFields: Boolean = true, // contextual idle bubble visibility (needs accessibility)
+    val bubbleKeyboardOnly: Boolean = false, // keyboard-only detection is opt-in
+    val bubbleDebounceMs: Int = BubbleDefaults.DEBOUNCE_MS,
+    val bubbleShowAnimationMs: Int = BubbleDefaults.SHOW_ANIMATION_MS,
+    val bubbleHideAnimationMs: Int = BubbleDefaults.HIDE_ANIMATION_MS,
     val hasCompletedOnboarding: Boolean = false, // first-run onboarding shown once; re-launchable from Settings
     // Experimental: Parakeet vocab-bias via sherpa hotwords + modified_beam_search. Off by
     // default — that decode path has an open upstream bug (k2-fsa/sherpa-onnx#3267) that
@@ -119,6 +124,12 @@ class SettingsRepository(private val context: Context) {
         val VAD_AUTO_STOP = booleanPreferencesKey("vadAutoStop")
         val REVIEW_BEFORE_INSERT = booleanPreferencesKey("reviewBeforeInsert")
         val BUBBLE_ONLY_ON_FIELDS = booleanPreferencesKey("bubbleOnlyOnFields")
+        // Earlier Dev builds enabled this experiment by default. Start with release
+        // behavior on upgrade; only a deliberate choice in this build opts in.
+        val BUBBLE_KEYBOARD_ONLY = booleanPreferencesKey("bubbleKeyboardOnlyOptIn")
+        val BUBBLE_DEBOUNCE_MS = intPreferencesKey("bubbleDebounceMs")
+        val BUBBLE_SHOW_ANIMATION_MS = intPreferencesKey("bubbleShowAnimationMs")
+        val BUBBLE_HIDE_ANIMATION_MS = intPreferencesKey("bubbleHideAnimationMs")
         val HAS_COMPLETED_ONBOARDING = booleanPreferencesKey("hasCompletedOnboarding")
         val PARAKEET_HOTWORDS_EXPERIMENTAL = booleanPreferencesKey("parakeetHotwordsExperimental")
     }
@@ -144,6 +155,10 @@ class SettingsRepository(private val context: Context) {
             vadAutoStop = p[Keys.VAD_AUTO_STOP] ?: defaults.vadAutoStop,
             reviewBeforeInsert = p[Keys.REVIEW_BEFORE_INSERT] ?: defaults.reviewBeforeInsert,
             bubbleOnlyOnFields = p[Keys.BUBBLE_ONLY_ON_FIELDS] ?: defaults.bubbleOnlyOnFields,
+            bubbleKeyboardOnly = p[Keys.BUBBLE_KEYBOARD_ONLY] ?: defaults.bubbleKeyboardOnly,
+            bubbleDebounceMs = (p[Keys.BUBBLE_DEBOUNCE_MS] ?: defaults.bubbleDebounceMs).coerceIn(0, BubbleDefaults.MAX_TIMING_MS),
+            bubbleShowAnimationMs = (p[Keys.BUBBLE_SHOW_ANIMATION_MS] ?: defaults.bubbleShowAnimationMs).coerceIn(0, BubbleDefaults.MAX_TIMING_MS),
+            bubbleHideAnimationMs = (p[Keys.BUBBLE_HIDE_ANIMATION_MS] ?: defaults.bubbleHideAnimationMs).coerceIn(0, BubbleDefaults.MAX_TIMING_MS),
             hasCompletedOnboarding = p[Keys.HAS_COMPLETED_ONBOARDING] ?: defaults.hasCompletedOnboarding,
             parakeetHotwordsExperimental = p[Keys.PARAKEET_HOTWORDS_EXPERIMENTAL] ?: defaults.parakeetHotwordsExperimental,
         )
@@ -171,6 +186,10 @@ class SettingsRepository(private val context: Context) {
             p[Keys.VAD_AUTO_STOP] = s.vadAutoStop
             p[Keys.REVIEW_BEFORE_INSERT] = s.reviewBeforeInsert
             p[Keys.BUBBLE_ONLY_ON_FIELDS] = s.bubbleOnlyOnFields
+            p[Keys.BUBBLE_KEYBOARD_ONLY] = s.bubbleKeyboardOnly
+            p[Keys.BUBBLE_DEBOUNCE_MS] = s.bubbleDebounceMs.coerceIn(0, BubbleDefaults.MAX_TIMING_MS)
+            p[Keys.BUBBLE_SHOW_ANIMATION_MS] = s.bubbleShowAnimationMs.coerceIn(0, BubbleDefaults.MAX_TIMING_MS)
+            p[Keys.BUBBLE_HIDE_ANIMATION_MS] = s.bubbleHideAnimationMs.coerceIn(0, BubbleDefaults.MAX_TIMING_MS)
             p[Keys.HAS_COMPLETED_ONBOARDING] = s.hasCompletedOnboarding
             p[Keys.PARAKEET_HOTWORDS_EXPERIMENTAL] = s.parakeetHotwordsExperimental
         }

@@ -15,6 +15,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import kotlinx.coroutines.runBlocking
 
 /**
  * Makes "insert the rewrite into the field I was typing in" possible. An overlay
@@ -74,10 +75,24 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             return true
         }
 
-        /** Re-check focus now (e.g. when the bubble (re)starts) so it shows if a field is already focused. */
+        /** Apply saved detection settings without restarting accessibility. */
+        fun updateBubbleSettings(settings: Settings) {
+            val svc = instance ?: return
+            svc.main.post {
+                val modeChanged = svc.keyboardOnlyDetection != settings.bubbleKeyboardOnly
+                svc.keyboardOnlyDetection = settings.bubbleKeyboardOnly
+                svc.debounceMs = settings.bubbleDebounceMs.coerceIn(0, BubbleDefaults.MAX_TIMING_MS).toLong()
+                if (modeChanged) {
+                    svc.main.removeCallbacks(svc.keyboardCheck)
+                    svc.evaluateBubbleVisibility()
+                }
+            }
+        }
+
+        /** Re-check input availability when the bubble (re)starts. */
         fun reevaluate() {
             val svc = instance ?: return
-            svc.main.post { svc.evaluateFieldFocus() }
+            svc.main.post { svc.evaluateBubbleVisibility() }
         }
     }
 
@@ -85,58 +100,60 @@ class OpenWisprAccessibilityService : AccessibilityService() {
     @Volatile private var pendingText: String? = null
     private var pendingPasteSession: ClipboardPasteSession? = null
     private val retryDelays = longArrayOf(250, 500, 900, 1400, 2000)
+    private var keyboardOnlyDetection = false
+    private var debounceMs = BubbleDefaults.DEBOUNCE_MS.toLong()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        val settings = try {
+            runBlocking { SettingsRepository(applicationContext).get() }
+        } catch (_: Exception) { Settings() }
+        keyboardOnlyDetection = settings.bubbleKeyboardOnly
+        debounceMs = settings.bubbleDebounceMs.toLong()
         Log.i(TAG, "service connected")
         // Now that focus detection is available, let the bubble switch to its
-        // "only show on text fields" behavior (it starts always-visible without us).
+        // contextual visibility behavior (it starts always-visible without us).
         BubbleService.instance?.refreshGating()
-        main.post { evaluateFieldFocus() }
+        main.post { evaluateBubbleVisibility() }
     }
 
-    /** Debounced re-check of whether a host text field is focused (drives the bubble). */
-    private val fieldCheck = Runnable { evaluateFieldFocus() }
+    /** Both detection modes use the configured debounce; defaults match v1.6.0. */
+    private val keyboardCheck = Runnable { evaluateBubbleVisibility() }
 
     /**
-     * Tell the bubble whether the user can currently type somewhere. Skips our own
-     * windows so the recording sheet doesn't flap the bubble.
-     *
-     * Two independent signals, OR'd: an open keyboard, and a focused editable node.
-     * The node scan alone is what left the bubble missing in Samsung Notes, Claude and
-     * ChatGPT (#69, #70) — plenty of apps never surface their composer as a focused
-     * editable we can see, whether because it's a Compose/WebView field, a custom
-     * editor, or a node the app marked sensitive (Android 14+ hides those from
-     * services that aren't declared accessibility tools). The keyboard is the more
-     * reliable of the two: if an IME has a window up, something editable has focus,
-     * however the app chose to draw it.
+     * Keyboard-only mode requires an input-method window. Turning it off restores
+     * the original keyboard-or-editable-focus detection, including its active-window
+     * fallback and preservation of visibility while our own activity is open.
+     * Recording and confirmations keep themselves visible separately in BubbleService.
      */
-    private fun evaluateFieldFocus() {
-        // Scan all interactive windows, not just rootInActiveWindow — across an app
-        // switch the "active window" can be null/transient, which left the bubble
-        // stuck. The focused editable lives in whichever window holds input focus.
+    private fun evaluateBubbleVisibility() {
         val wins = try { windows } catch (_: Exception) { null }
+        if (keyboardOnlyDetection) {
+            // An IME window need not expose a root node. Never use editable focus
+            // or retain a stale positive result when keyboard windows are absent.
+            val imeOpen = wins?.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD } == true
+            Log.d(TAG, "bubbleFocus mode=keyboard ime=$imeOpen host=$lastHostPackage")
+            BubbleService.instance?.setInputAvailable(imeOpen)
+            return
+        }
         if (wins.isNullOrEmpty()) {
             val root = rootInActiveWindow ?: return
             if (root.packageName == packageName) return
             val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             val editable = f != null && f.isEditable
             @Suppress("DEPRECATION") f?.recycle()
-            Log.d(TAG, "fieldFocus(fallback) editable=$editable")
-            BubbleService.instance?.setFieldFocused(editable)
+            Log.d(TAG, "bubbleFocus mode=original(fallback) editable=$editable")
+            BubbleService.instance?.setInputAvailable(editable)
             return
         }
         var editable = false
         var imeOpen = false
         var ourModalActive = false
         for (w in wins) {
-            // Checked before w.root, which an IME window need not give us at all.
             if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) { imeOpen = true; continue }
             val root = w.root ?: continue
             if (root.packageName == packageName) {
-                // Our recording/transform sheet (an activity) — don't flap the bubble.
-                // The bubble's own overlay window is harmless; only the modal counts.
                 if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION) ourModalActive = true
                 continue
             }
@@ -147,9 +164,9 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             }
             if (editable) break
         }
-        if (ourModalActive) return // leave the bubble as-is while our sheet is up
-        Log.d(TAG, "fieldFocus editable=$editable ime=$imeOpen host=$lastHostPackage")
-        BubbleService.instance?.setFieldFocused(editable || imeOpen)
+        if (ourModalActive) return
+        Log.d(TAG, "bubbleFocus mode=original editable=$editable ime=$imeOpen host=$lastHostPackage")
+        BubbleService.instance?.setInputAvailable(editable || imeOpen)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -160,7 +177,7 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             val pkg = event.packageName?.toString()
             if (pkg != null && isHostPackage(pkg, packageName)) lastHostPackage = pkg
         }
-        // Drive the field-gated bubble: re-check focus on any event that can change it
+        // Drive the keyboard-gated bubble: re-check on events that can change it
         // (coalesced — content-changed and windows-changed both fire in bursts).
         // TYPE_WINDOWS_CHANGED is what tells us the keyboard came or went: dismissing
         // an IME needn't touch focus or window state, so without it the bubble would
@@ -171,8 +188,8 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                main.removeCallbacks(fieldCheck)
-                main.postDelayed(fieldCheck, 120)
+                main.removeCallbacks(keyboardCheck)
+                main.postDelayed(keyboardCheck, debounceMs)
             }
         }
         if (pendingText == null) return
@@ -191,7 +208,7 @@ class OpenWisprAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        main.removeCallbacks(fieldCheck)
+        main.removeCallbacks(keyboardCheck)
         if (instance === this) instance = null
         // Service gone — focus detection is impossible, so let the bubble show always.
         BubbleService.instance?.refreshGating()

@@ -80,6 +80,7 @@ import com.voicerewriter.ui.OpenWisprTheme
 import com.voicerewriter.ui.SunsetBrush
 import com.voicerewriter.ui.Wordmark
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /**
  * Settings, redesigned to the OpenWispr Settings spec: a sectioned, on-device-first
@@ -136,6 +137,10 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
     var reviewBeforeInsert by remember { mutableStateOf(false) }
     var parakeetHotwordsExperimental by remember { mutableStateOf(false) }
     var bubbleOnlyOnFields by remember { mutableStateOf(true) }
+    var bubbleKeyboardOnly by remember { mutableStateOf(false) }
+    var bubbleDebounceMs by remember { mutableStateOf(BubbleDefaults.DEBOUNCE_MS) }
+    var bubbleShowAnimationMs by remember { mutableStateOf(BubbleDefaults.SHOW_ANIMATION_MS) }
+    var bubbleHideAnimationMs by remember { mutableStateOf(BubbleDefaults.HIDE_ANIMATION_MS) }
     var keepHistory by remember { mutableStateOf(DictationHistory.keepHistory(context)) }
     var audioKeepDays by remember { mutableStateOf(PendingAudio.keepDays(context)) }
 
@@ -174,6 +179,10 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
         defaultMode = s.defaultMode
         deterministicCleanup = s.deterministicCleanup; polishLevel = s.polishLevel
         vadAutoStop = s.vadAutoStop; bubbleOnlyOnFields = s.bubbleOnlyOnFields
+        bubbleKeyboardOnly = s.bubbleKeyboardOnly
+        bubbleDebounceMs = s.bubbleDebounceMs
+        bubbleShowAnimationMs = s.bubbleShowAnimationMs
+        bubbleHideAnimationMs = s.bubbleHideAnimationMs
         reviewBeforeInsert = s.reviewBeforeInsert
         parakeetHotwordsExperimental = s.parakeetHotwordsExperimental
         a11yEnabled = SetupUtils.accessibilityEnabled(context)
@@ -229,6 +238,10 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
         sttModel = sttModel.trim(), sttLanguage = sttLanguage, defaultMode = defaultMode,
         deterministicCleanup = deterministicCleanup, polishLevel = polishLevel,
         vadAutoStop = vadAutoStop, bubbleOnlyOnFields = bubbleOnlyOnFields,
+        bubbleKeyboardOnly = bubbleKeyboardOnly,
+        bubbleDebounceMs = bubbleDebounceMs,
+        bubbleShowAnimationMs = bubbleShowAnimationMs,
+        bubbleHideAnimationMs = bubbleHideAnimationMs,
         reviewBeforeInsert = reviewBeforeInsert,
         hasCompletedOnboarding = true,
         parakeetHotwordsExperimental = parakeetHotwordsExperimental,
@@ -236,7 +249,9 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
 
     // Persist silently on every change (the design saves immediately).
     fun persist() = launch {
-        repo.save(snapshot())
+        val settings = snapshot()
+        repo.save(settings)
+        OpenWisprAccessibilityService.updateBubbleSettings(settings)
         BubbleService.instance?.refreshGating()
     }
 
@@ -530,8 +545,8 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
                         if (want) enableBubble() else { SetupUtils.stopBubble(context); bubbleOn = false }
                     }
                     Divider()
-                    // Field gating is driven by the accessibility service (BubbleService.gateActive
-                    // needs it to know what's focused). With the grant revoked the toggle keeps
+                    // Contextual visibility is driven by the accessibility service. With the
+                    // grant revoked the toggle keeps
                     // reading "on" while the bubble is in fact always visible, which looks like the
                     // setting broke. Say so instead.
                     ToggleRow(
@@ -540,6 +555,40 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
                         else "Appear only when you can type",
                         bubbleOnlyOnFields,
                     ) { bubbleOnlyOnFields = it; persist() }
+                    Divider()
+                    ToggleRow(
+                        "Keyboard-only detection",
+                        if (!bubbleOnlyOnFields) "Enable Only on text fields to use detection"
+                        else if (!a11yEnabled) "Needs auto-insert to detect the keyboard or text fields"
+                        else if (bubbleKeyboardOnly) "Show only while the on-screen keyboard is visible"
+                        else "Original detection: keyboard visible or text field focused",
+                        bubbleKeyboardOnly,
+                    ) { bubbleKeyboardOnly = it; persist() }
+                    Divider()
+                    BubbleTimingRow(
+                        "Detection debounce", "Wait for input events to settle before checking visibility",
+                        bubbleDebounceMs, { bubbleDebounceMs = it }, { persist() },
+                    )
+                    Divider()
+                    BubbleTimingRow(
+                        "Show animation", "Time for the bubble to fade and grow into view",
+                        bubbleShowAnimationMs, { bubbleShowAnimationMs = it }, { persist() },
+                    )
+                    Divider()
+                    BubbleTimingRow(
+                        "Hide animation", "Time for the bubble to fade and shrink out of view",
+                        bubbleHideAnimationMs, { bubbleHideAnimationMs = it }, { persist() },
+                    )
+                    TextButton(onClick = {
+                        bubbleOnlyOnFields = true
+                        bubbleKeyboardOnly = false
+                        bubbleDebounceMs = BubbleDefaults.DEBOUNCE_MS
+                        bubbleShowAnimationMs = BubbleDefaults.SHOW_ANIMATION_MS
+                        bubbleHideAnimationMs = BubbleDefaults.HIDE_ANIMATION_MS
+                        persist()
+                    }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                        Text("Restore 1.6.0 bubble defaults")
+                    }
                 }
             }
 
@@ -603,6 +652,10 @@ private fun SettingsScreen(repo: SettingsRepository, launch: (suspend () -> Unit
             // ---------------- RELIABILITY ----------------
             Section("Reliability") {
                 Card {
+                    NavRow("Insertion diagnostics", "Failed insertions by app · capped at 2 MiB") {
+                        context.startActivity(Intent(context, InsertionDiagnosticsActivity::class.java))
+                    }
+                    Divider()
                     NavRow("Auto-start helper", "For Samsung, Xiaomi, OnePlus, Oppo") {
                         val intent = SetupUtils.oemAutoStartIntents().firstOrNull { it.resolveActivity(context.packageManager) != null }
                             ?: SetupUtils.appInfoIntent(context)
@@ -948,6 +1001,30 @@ private fun ModelRow(
 private fun Badge(text: String, fg: Color, bg: Color) {
     Box(Modifier.clip(RoundedCornerShape(20.dp)).background(bg).padding(horizontal = 10.dp, vertical = 5.dp)) {
         Text(text.uppercase(), style = MonoEyebrow, fontSize = 10.sp, color = fg)
+    }
+}
+
+@Composable
+private fun BubbleTimingRow(
+    title: String,
+    subtitle: String,
+    valueMs: Int,
+    onChange: (Int) -> Unit,
+    onChangeFinished: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+            Text("$valueMs ms", style = MaterialTheme.typography.bodyMedium)
+        }
+        Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Slider(
+            value = valueMs.toFloat(),
+            onValueChange = { onChange(it.roundToInt()) },
+            onValueChangeFinished = onChangeFinished,
+            valueRange = 0f..BubbleDefaults.MAX_TIMING_MS.toFloat(),
+            steps = BubbleDefaults.MAX_TIMING_MS / 5 - 1,
+        )
     }
 }
 
