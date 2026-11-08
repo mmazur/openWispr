@@ -47,6 +47,10 @@
 
         <!-- Personal dictionary management -->
         <activity
+            android:name=".InsertionDiagnosticsActivity"
+            android:exported="false"
+            android:label="Insertion diagnostics" />
+        <activity
             android:name=".VocabActivity"
             android:exported="false"
             android:label="Personal dictionary" />

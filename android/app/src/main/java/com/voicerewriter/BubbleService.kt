@@ -616,11 +616,14 @@ class BubbleService : Service() {
     }
 
     private fun launchRewrite(mode: String, autoRecord: Boolean = true, pushToTalk: Boolean = false) {
+        val target = OpenWisprAccessibilityService.captureInputTarget()
         startActivity(
             Intent(this, RewriteActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 .putExtra(RewriteActivity.EXTRA_AUTO_RECORD, autoRecord)
                 .putExtra(RewriteActivity.EXTRA_PUSH_TO_TALK, pushToTalk)
+                .putExtra(RewriteActivity.EXTRA_INSERTION_TARGET, target?.packageName)
+                .putExtra(RewriteActivity.EXTRA_INSERTION_FOCUS, target?.description)
         )
     }
 

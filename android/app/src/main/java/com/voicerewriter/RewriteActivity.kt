@@ -111,6 +111,8 @@ class RewriteActivity : ComponentActivity() {
         const val EXTRA_AUTO_RECORD = "com.voicerewriter.AUTO_RECORD"
         /** Hold-to-talk: the bubble is holding the gesture and its release ends the take. */
         const val EXTRA_PUSH_TO_TALK = "com.voicerewriter.PUSH_TO_TALK"
+        const val EXTRA_INSERTION_TARGET = "com.voicerewriter.INSERTION_TARGET"
+        const val EXTRA_INSERTION_FOCUS = "com.voicerewriter.INSERTION_FOCUS"
 
         /** Re-transcribe a saved recording instead of opening the mic (see [PendingAudio]). */
         const val EXTRA_RETRY_ID = "com.voicerewriter.RETRY_ID"
@@ -240,13 +242,21 @@ class RewriteActivity : ComponentActivity() {
         // No toast on the clipboard fallback: users who skipped Accessibility chose the
         // clipboard deliberately, so being told about it after every single dictation (and
         // nudged to grant the permission again) is nagging, not information.
-        // Capture before finish(): Android 10+ prevents background clipboard reads
-        // once the host app regains focus.
+        // Capture before finish(): after the host regains focus, Android prevents
+        // our accessibility service reading the clipboard it needs to preserve.
         val capture = if (OpenWisprAccessibilityService.isEnabled) {
             ClipboardPasteSession.capture(applicationContext, window.decorView.hasWindowFocus())
         } else ClipboardPasteCapture(null, "accessibility_disabled")
-        val enqueued = OpenWisprAccessibilityService.enqueueInsert(result, capture)
-        if (!enqueued) setClipboard(result)
+        val target = intent.getStringExtra(EXTRA_INSERTION_TARGET) ?: dictationHostPkg
+        val initialFocus = intent.getStringExtra(EXTRA_INSERTION_FOCUS).orEmpty()
+        val enqueued = OpenWisprAccessibilityService.enqueueInsert(result, capture, target, initialFocus)
+        if (!enqueued) {
+            setClipboard(result)
+            InsertionDiagnostics.begin(this, target, initialFocus)?.apply {
+                add("Accessibility service unavailable; copied for manual paste")
+                finish("accessibility_disabled")
+            }
+        }
         LastDictation.set(this, result)
         // Delivery is confirmed — inserted, or on the clipboard where the user can reach it —
         // and the transcript is already in history. Only now is the recording settled, which

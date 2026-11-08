@@ -17,8 +17,11 @@ internal class ClipboardPasteSession(
     private val onRestoreFailure: (Exception) -> Unit,
     private val afterSuccessfulPaste: (() -> Unit) -> Unit = { it() },
 ) {
+    internal var diagnostics: ((String, Boolean) -> Unit)? = null
+
     fun paste(text: String, performPaste: () -> Boolean): Boolean {
         stage(text)
+        diagnostics?.invoke("Temporary clipboard staged", false)
         var pasted = false
         return try {
             performPaste().also { pasted = it }
@@ -28,7 +31,9 @@ internal class ClipboardPasteSession(
             val restoreSafely: () -> Unit = {
                 try {
                     restore()
+                    diagnostics?.invoke("Original clipboard restored", false)
                 } catch (e: Exception) {
+                    diagnostics?.invoke("Clipboard restore failed type=${e.javaClass.simpleName}", true)
                     // A successful paste must not be retried (duplicating text)
                     // merely because restoring the clipboard failed.
                     onRestoreFailure(e)

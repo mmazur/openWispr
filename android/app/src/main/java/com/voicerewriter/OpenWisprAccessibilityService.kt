@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -69,10 +70,34 @@ class OpenWisprAccessibilityService : AccessibilityService() {
          * is running (so the caller knows auto-insert will be attempted).
          * Call from the main thread.
          */
-        internal fun enqueueInsert(text: String, capture: ClipboardPasteCapture): Boolean {
+        internal fun enqueueInsert(text: String, capture: ClipboardPasteCapture, targetPackage: String?, initialFocus: String): Boolean {
             val svc = instance ?: return false
-            svc.startInsert(text, capture)
+            svc.startInsert(text, capture, targetPackage, initialFocus)
             return true
+        }
+
+        data class InputTargetSnapshot(val packageName: String?, val description: String)
+
+        /** Called only when the user starts a dictation, before our activity takes focus. */
+        fun captureInputTarget(): InputTargetSnapshot? {
+            val svc = instance ?: return null
+            if (!InsertionDiagnostics.enabled(svc)) return null
+            return try {
+                for (window in svc.windows) {
+                    if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION || (!window.isFocused && !window.isActive)) continue
+                    val root = window.root ?: continue
+                    val pkg = root.packageName?.toString() ?: continue
+                    if (pkg == svc.packageName || pkg in NON_HOST_PACKAGES) continue
+                    val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    val description = "windowActive=${window.isActive} windowFocused=${window.isFocused} " +
+                        "input=${focused?.let { svc.nodeDiagnostics(it) } ?: "none"}"
+                    @Suppress("DEPRECATION") focused?.recycle()
+                    return InputTargetSnapshot(pkg, description)
+                }
+                InputTargetSnapshot(lastHostPackage, "No focused application window exposed")
+            } catch (_: Exception) {
+                InputTargetSnapshot(lastHostPackage, "Application focus snapshot unavailable")
+            }
         }
 
         /** Apply saved detection settings without restarting accessibility. */
@@ -99,6 +124,18 @@ class OpenWisprAccessibilityService : AccessibilityService() {
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var pendingText: String? = null
     private var pendingPasteSession: ClipboardPasteSession? = null
+    private var insertionId = 0
+    private var insertionAttempt = 0
+    private var insertionStartedAt = 0L
+    private var insertionTrace: InsertionTrace? = null
+    private var pendingTargetPackage: String? = null
+    private val retryGate = InsertionRetryGate()
+    private var insertCheckScheduled = false
+    private val insertCheck = Runnable {
+        insertCheckScheduled = false
+        attemptInsert()
+    }
+    private var lastWindowDiagnosticsAt = 0L
     private val retryDelays = longArrayOf(250, 500, 900, 1400, 2000)
     private var keyboardOnlyDetection = false
     private var debounceMs = BubbleDefaults.DEBOUNCE_MS.toLong()
@@ -199,7 +236,7 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 val pkg = event.packageName
-                if (pkg != null && pkg != packageName) attemptInsert()
+                if (pkg != null && pkg != packageName) requestInsertAttempt()
             }
         }
     }
@@ -208,7 +245,16 @@ class OpenWisprAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        main.removeCallbacks(keyboardCheck)
+        pendingText?.let { text ->
+            runCatching { setClipboard(text) }
+            BubbleService.instance?.showClipboardFallback()
+        }
+        insertionTrace?.finish("service_disconnected")
+        insertionTrace = null
+        main.removeCallbacksAndMessages(null)
+        insertCheckScheduled = false
+        pendingText = null
+        pendingPasteSession = null
         if (instance === this) instance = null
         // Service gone — focus detection is impossible, so let the bubble show always.
         BubbleService.instance?.refreshGating()
@@ -216,20 +262,39 @@ class OpenWisprAccessibilityService : AccessibilityService() {
 
     // ---------------- insertion ----------------
 
-    private fun startInsert(text: String, capture: ClipboardPasteCapture) {
+    private fun startInsert(text: String, capture: ClipboardPasteCapture, targetPackage: String?, initialFocus: String) {
         // Note: we deliberately do NOT stage the clipboard here. The common insert path
         // writes the text straight into the field (ACTION_SET_TEXT) without touching the
         // clipboard, so a successful dictation no longer clobbers what the user had copied.
         // The clipboard is only used as a fallback (see attemptInsert / the give-up branch).
+        insertionTrace?.finish("superseded")
+        insertionTrace = InsertionDiagnostics.begin(this, targetPackage, initialFocus)
+        val requestTrace = insertionTrace
+        val pasteSession = capture.session
+        pasteSession?.diagnostics = { message, error ->
+            requestTrace?.add(message)
+            if (error) requestTrace?.problem = "clipboard_restore_failed"
+        }
         pendingText = text
-        pendingPasteSession = capture.session
+        pendingPasteSession = pasteSession
+        pendingTargetPackage = targetPackage
+        retryGate.reset()
+        lastWindowDiagnosticsAt = 0L
+        insertionId++
+        insertionAttempt = 0
+        insertionStartedAt = SystemClock.uptimeMillis()
+        trace("request=$insertionId queued chars=${text.length} clipboardCapture=${capture.reason} target=$targetPackage")
         main.removeCallbacksAndMessages(null)
+        insertCheckScheduled = false
         // Backstop retries in case the focus event doesn't arrive.
-        for (delay in retryDelays) main.postDelayed({ attemptInsert() }, delay)
+        for (delay in retryDelays) main.postDelayed({ requestInsertAttempt() }, delay)
         // Give up after the last retry: no field ever focused — fall back to a clipboard copy.
         main.postDelayed({
             val t = pendingText
             if (t != null) {
+                trace("request=$insertionId gaveUp attempts=$insertionAttempt elapsedMs=${SystemClock.uptimeMillis() - insertionStartedAt}; copying for manual paste")
+                insertionTrace?.finish("clipboard_fallback")
+                insertionTrace = null
                 pendingText = null
                 pendingPasteSession = null
                 setClipboard(t)
@@ -252,26 +317,61 @@ class OpenWisprAccessibilityService : AccessibilityService() {
         }, retryDelays.last() + 300)
     }
 
+    /** Coalesce event storms; accessibility queries must not generate a retry loop. */
+    private fun requestInsertAttempt() {
+        if (pendingText == null || insertCheckScheduled) return
+        val now = SystemClock.uptimeMillis()
+        if (now - insertionStartedAt >= retryDelays.last() + 300) return
+        insertCheckScheduled = true
+        main.postDelayed(insertCheck, retryGate.delayMs(now))
+    }
+
     /** Try once to insert into the host app's focused editable field. */
     private fun attemptInsert() {
         val text = pendingText ?: return
+        val now = SystemClock.uptimeMillis()
+        if (now - insertionStartedAt >= retryDelays.last() + 300) return
+        retryGate.attempted(now)
+        insertionAttempt++
+        trace("request=$insertionId attempt=$insertionAttempt elapsedMs=${SystemClock.uptimeMillis() - insertionStartedAt}")
         val node = findHostFocusedEditable() ?: return
+        val beforeText = node.text?.toString().orEmpty()
+        trace("request=$insertionId target ${nodeDiagnostics(node)}")
         var viaPaste = false
         val ok = try {
             // Prefer a clipboard-free splice at the cursor; fall back to paste only when
             // we can't determine the cursor (e.g. some WebView fields).
-            insertAtCursor(node, text) || run { viaPaste = true; pasteViaClipboard(node, text) }
+            val direct = try {
+                insertAtCursor(node, text)
+            } catch (e: Exception) {
+                insertionTrace?.directFailed("set_text_exception_${e.javaClass.simpleName}")
+                false
+            }
+            val accepted = direct || run { viaPaste = true; pasteViaClipboard(node, text) }
+            if (accepted) {
+                // Diagnostics must never turn an accepted action into an insertion
+                // retry, which could duplicate the user's text.
+                runCatching { logInsertionReadback(node, beforeText, text, viaPaste, insertionTrace) }
+                    .onFailure {
+                        trace("Readback scheduling unavailable type=${it.javaClass.simpleName}")
+                        insertionTrace?.finish("accepted_unverified")
+                    }
+            }
+            accepted
         } catch (e: Exception) {
+            trace("Insertion exception type=${e.javaClass.simpleName}")
             Log.e(TAG, "insert action failed", e); false
         } finally {
             @Suppress("DEPRECATION") node.recycle()
         }
         if (ok) {
+            insertionTrace = null // the readback callback owns this request's trace now
             Log.i(TAG, if (viaPaste) "inserted via temporary clipboard paste"
                        else "inserted at cursor (clipboard untouched)")
             pendingText = null
             pendingPasteSession = null
             main.removeCallbacksAndMessages(null)
+            insertCheckScheduled = false
             // The haptic tick is the confirmation. A toast on top of text visibly appearing in
             // the field is telling the user something they can already see.
             vibrateTick()
@@ -292,39 +392,116 @@ class OpenWisprAccessibilityService : AccessibilityService() {
     private fun insertAtCursor(node: AccessibilityNodeInfo, insert: String): Boolean {
         val showingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && node.isShowingHintText
         val edit = buildInputTextEdit(node.text?.toString(), showingHint,
-            node.textSelectionStart, node.textSelectionEnd, insert) ?: return false
+            node.textSelectionStart, node.textSelectionEnd, insert) ?: run {
+            insertionTrace?.directFailed("unknown_cursor_in_nonempty_field")
+            return false
+        }
+        if (showingHint) trace("Treating placeholder as empty input for direct insertion")
         val setArgs = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, edit.text)
         }
-        if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)) return false
-        val cursor = edit.cursor
-        val selArgs = Bundle().apply {
-            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, cursor)
-            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, cursor)
+        val accepted = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+        trace("request=$insertionId action=SET_TEXT accepted=$accepted")
+        if (!accepted) {
+            insertionTrace?.directFailed("set_text_action_rejected")
+            return false
         }
-        // Text was already accepted. Cursor-placement failure must not cause a
-        // later retry to insert it again.
+        val selArgs = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, edit.cursor)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, edit.cursor)
+        }
+        // Text was accepted already. A cursor-placement failure must not cause a
+        // second insertion through paste or a subsequent retry.
         runCatching { node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs) }
-            .onFailure { Log.w(TAG, "cursor placement failed after accepted insertion", it) }
+            .onFailure { trace("Cursor placement unavailable type=${it.javaClass.simpleName}") }
         return true
     }
 
-    /** Fallback insert: borrow the clipboard, then restore its original contents. */
+    /** Fallback insert: borrow the clipboard for the paste, then restore its original contents. */
     private fun pasteViaClipboard(node: AccessibilityNodeInfo, text: String): Boolean {
-        val session = pendingPasteSession ?: return false
+        val session = pendingPasteSession ?: run {
+            trace("request=$insertionId paste skipped: clipboard snapshot unavailable")
+            return false
+        }
         return session.paste(text) {
-            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            node.performAction(AccessibilityNodeInfo.ACTION_PASTE).also {
+                trace("request=$insertionId action=PASTE accepted=$it")
+            }
         }
     }
 
     /** Focused editable node in the active window, only if it's NOT our own app. */
     private fun findHostFocusedEditable(): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
-        if (root.packageName == packageName) return null // our sheet is still up
+        val root = rootInActiveWindow ?: run {
+            traceState("lookup", "lookup=no-active-root")
+            return null
+        }
+        if (root.packageName == packageName) {
+            traceState("lookup", "lookup=self-window")
+            return null
+        }
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        traceState("lookup", "rootPackage=${root.packageName} rootChildren=${root.childCount} focused=${focused?.let { nodeDiagnostics(it) } ?: "none"}")
         if (focused != null && focused.isEditable) return focused
         @Suppress("DEPRECATION") focused?.recycle()
+        logInteractiveWindows()
         return null
+    }
+
+    /** Structural diagnostics only: never log field contents or the dictated text. */
+    private fun nodeDiagnostics(node: AccessibilityNodeInfo): String =
+        "package=${node.packageName} class=${node.className} editable=${node.isEditable} " +
+            "focused=${node.isFocused} visible=${node.isVisibleToUser} enabled=${node.isEnabled} " +
+            "password=${node.isPassword} hint=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && node.isShowingHintText} " +
+            "sensitive=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && node.isAccessibilityDataSensitive} " +
+            "chars=${node.text?.length ?: 0} selection=${node.textSelectionStart}:${node.textSelectionEnd} " +
+            "actions=${node.actionList.map { it.id }}"
+
+    private fun logInteractiveWindows() {
+        if (insertionTrace == null) return
+        val now = SystemClock.uptimeMillis()
+        if (lastWindowDiagnosticsAt != 0L && now - lastWindowDiagnosticsAt < 500) return
+        lastWindowDiagnosticsAt = now
+        try {
+            for (window in windows) {
+                val root = window.root
+                val focused = root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                traceState("window-${window.id}", "window type=${window.type} active=${window.isActive} focused=${window.isFocused} rootPackage=${root?.packageName} input=${focused?.let { nodeDiagnostics(it) } ?: "none"}")
+                @Suppress("DEPRECATION") focused?.recycle()
+            }
+        } catch (e: Exception) {
+            trace("request=$insertionId window diagnostics unavailable: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun trace(message: String) { insertionTrace?.add(message) }
+    private fun traceState(key: String, message: String) { insertionTrace?.state(key, message) }
+
+    private fun logInsertionReadback(node: AccessibilityNodeInfo, beforeText: String, insert: String,
+                                     viaPaste: Boolean, requestTrace: InsertionTrace?) {
+        requestTrace ?: return
+        @Suppress("DEPRECATION") val probe = AccessibilityNodeInfo.obtain(node)
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                val refreshed = probe.refresh()
+                val afterText = if (refreshed && !probe.isPassword) probe.text?.toString() else null
+                val changed = afterText != null && afterText != beforeText
+                val containsInserted = afterText?.contains(insert) == true
+                requestTrace.add("readbackAfterMs=500 method=${if (viaPaste) "PASTE" else "SET_TEXT"} refreshed=$refreshed " +
+                    "focused=${probe.isFocused} chars=${afterText?.length} changed=$changed containsInserted=$containsInserted")
+                if (!viaPaste && (!changed || !containsInserted)) requestTrace.directFailed("set_text_accepted_but_not_observed")
+                requestTrace.finish(when {
+                    !changed || !containsInserted -> "accepted_not_observed"
+                    viaPaste -> "direct_entry_failed_paste_succeeded"
+                    else -> null
+                })
+            } catch (e: Exception) {
+                requestTrace.add("Readback unavailable type=${e.javaClass.simpleName}")
+                requestTrace.finish("accepted_unverified")
+            } finally {
+                @Suppress("DEPRECATION") probe.recycle()
+            }
+        }, 500)
     }
 
     private fun setClipboard(text: String) {
