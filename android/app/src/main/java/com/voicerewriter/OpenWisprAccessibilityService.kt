@@ -273,21 +273,14 @@ class OpenWisprAccessibilityService : AccessibilityService() {
      * paste. This is the path that keeps the clipboard untouched on a normal dictation.
      */
     private fun insertAtCursor(node: AccessibilityNodeInfo, insert: String): Boolean {
-        val current = node.text?.toString() ?: ""
-        val selA = node.textSelectionStart
-        val selB = node.textSelectionEnd
-        val (start, end) = when {
-            selA in 0..current.length && selB in 0..current.length ->
-                minOf(selA, selB) to maxOf(selA, selB)
-            current.isEmpty() -> 0 to 0
-            else -> return false // unknown cursor in a non-empty field — let paste handle it
-        }
-        val newText = current.substring(0, start) + insert + current.substring(end)
+        val showingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && node.isShowingHintText
+        val edit = buildInputTextEdit(node.text?.toString(), showingHint,
+            node.textSelectionStart, node.textSelectionEnd, insert) ?: return false
         val setArgs = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText)
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, edit.text)
         }
         if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)) return false
-        val cursor = start + insert.length
+        val cursor = edit.cursor
         val selArgs = Bundle().apply {
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, cursor)
             putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, cursor)
