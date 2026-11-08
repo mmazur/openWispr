@@ -444,8 +444,82 @@ class OpenWisprAccessibilityService : AccessibilityService() {
         traceState("lookup", "rootPackage=${root.packageName} rootChildren=${root.childCount} focused=${focused?.let { nodeDiagnostics(it) } ?: "none"}")
         if (focused != null && focused.isEditable) return focused
         @Suppress("DEPRECATION") focused?.recycle()
-        logInteractiveWindows()
-        return null
+        // Restrict focus recovery to the intended app. Do not choose an input in
+        // a different app that happens to become active during transcription.
+        val target = pendingTargetPackage
+        if (target != null && target != root.packageName?.toString()) {
+            traceState("tree-policy", "tree scan skipped: active package differs from intended target=$target")
+            return null
+        }
+        val candidate = findEditableInTree(root)
+        if (candidate == null) logInteractiveWindows()
+        return candidate
+    }
+
+    /** Breadth-first search with both node-count and wall-time limits. */
+    private fun findEditableInTree(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val editors = mutableListOf<AccessibilityNodeInfo>()
+        val samples = mutableListOf<String>()
+        var visited = 0
+        var truncated = false
+        val deadline = SystemClock.uptimeMillis() + 60
+        if (!runCatching { root.refresh() }.getOrDefault(false)) {
+            traceState("tree-refresh", "tree scan skipped: root refresh failed")
+            return null
+        }
+        @Suppress("DEPRECATION") queue.add(AccessibilityNodeInfo.obtain(root))
+        var result: AccessibilityNodeInfo? = null
+        try {
+            while (queue.isNotEmpty() && visited < 128 && SystemClock.uptimeMillis() < deadline) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    if (samples.size < 6) samples.add(nodeDiagnostics(node))
+                    if (node.isEditable) {
+                        @Suppress("DEPRECATION") editors.add(AccessibilityNodeInfo.obtain(node))
+                    }
+                    val children = minOf(node.childCount, (128 - visited - queue.size).coerceAtLeast(0))
+                    if (children < node.childCount) truncated = true
+                    for (i in 0 until children) {
+                        if (SystemClock.uptimeMillis() >= deadline) { truncated = true; break }
+                        node.getChild(i)?.let { queue.addLast(it) }
+                    }
+                } finally {
+                    @Suppress("DEPRECATION") node.recycle()
+                }
+            }
+            val complete = queue.isEmpty() && !truncated
+            val choices = editors.map {
+                EditableTarget(it.isFocused, it.isVisibleToUser, it.isEnabled,
+                    it.actionList.any { action -> action.id == AccessibilityNodeInfo.ACTION_FOCUS }, it.isPassword)
+            }
+            val choice = chooseEditableTarget(choices)
+            traceState("tree-summary", "tree visited=$visited complete=$complete editors=${editors.size} decision=${choice.reason}")
+            editors.take(8).forEachIndexed { index, node -> traceState("editor-$index", "editor[$index] ${nodeDiagnostics(node)}") }
+            if (editors.isEmpty()) samples.forEachIndexed { index, sample -> traceState("sample-$index", "tree sample[$index] $sample") }
+            val index = choice.index ?: return null
+            val selected = editors[index]
+            if (choice.needsFocus) {
+                // A truncated tree cannot establish that this is the only editor.
+                if (!complete) {
+                    traceState("focus-recovery", "focus recovery skipped: tree scan incomplete")
+                    return null
+                }
+                val accepted = selected.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                val refreshed = selected.refresh()
+                traceState("focus-recovery", "focus recovery accepted=$accepted refreshed=$refreshed focused=${selected.isFocused}")
+                if (!accepted || !refreshed || !selected.isFocused) return null
+            }
+            result = selected
+            return selected
+        } catch (e: Exception) {
+            traceState("tree-error", "tree lookup unavailable type=${e.javaClass.simpleName}")
+            return null
+        } finally {
+            queue.forEach { @Suppress("DEPRECATION") it.recycle() }
+            editors.filter { it !== result }.forEach { @Suppress("DEPRECATION") it.recycle() }
+        }
     }
 
     /** Structural diagnostics only: never log field contents or the dictated text. */
