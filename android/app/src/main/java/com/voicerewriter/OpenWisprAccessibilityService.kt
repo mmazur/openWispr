@@ -1,6 +1,7 @@
 package com.voicerewriter
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.InputMethod
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -16,6 +17,8 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.view.inputmethod.EditorInfo
+import androidx.annotation.RequiresApi
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -158,20 +161,51 @@ class OpenWisprAccessibilityService : AccessibilityService() {
     /** Both detection modes use the configured debounce; defaults match v1.6.0. */
     private val keyboardCheck = Runnable { evaluateBubbleVisibility() }
 
+    private fun scheduleBubbleCheck() {
+        main.removeCallbacks(keyboardCheck)
+        main.postDelayed(keyboardCheck, debounceMs)
+    }
+
+    /** Observe the same editor attributes provided to the keyboard on Android 13+. */
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    override fun onCreateInputMethod(): InputMethod = BubbleInputMethod(this) { scheduleBubbleCheck() }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private class BubbleInputMethod(service: AccessibilityService, private val changed: () -> Unit) : InputMethod(service) {
+        override fun onStartInput(attribute: EditorInfo, restarting: Boolean) {
+            changed()
+        }
+
+        override fun onFinishInput() {
+            // Observe only: do not call the default implementation, which may
+            // finish composing text on some Android versions. Posting the check
+            // lets Android clear the old EditorInfo before we read it.
+            changed()
+        }
+    }
+
     /**
      * Keyboard-only mode requires an input-method window. Turning it off restores
      * the original keyboard-or-editable-focus detection, including its active-window
      * fallback and preservation of visibility while our own activity is open.
+     * Both modes suppress numeric fields when the host exposes their input type.
      * Recording and confirmations keep themselves visible separately in BubbleService.
      */
     private fun evaluateBubbleVisibility() {
         val wins = try { windows } catch (_: Exception) { null }
+        val inputType = focusedHostInputType(wins)
+        val editor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            inputMethod?.takeIf { it.currentInputStarted }?.currentInputEditorInfo
+        } else null
+        val editorInputType = editor?.inputType
         if (keyboardOnlyDetection) {
             // An IME window need not expose a root node. Never use editable focus
             // or retain a stale positive result when keyboard windows are absent.
             val imeOpen = wins?.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD } == true
-            Log.d(TAG, "bubbleFocus mode=keyboard ime=$imeOpen host=$lastHostPackage")
-            BubbleService.instance?.setInputAvailable(imeOpen)
+            Log.d(TAG, "bubbleFocus mode=keyboard ime=$imeOpen inputType=$inputType editorInputType=$editorInputType editorPackage=${editor?.packageName} host=$lastHostPackage")
+            BubbleService.instance?.setInputAvailable(bubbleInputAvailable(
+                keyboardOnly = true, imeOpen = imeOpen, editable = false, inputType = inputType, editorInputType = editorInputType,
+            ))
             return
         }
         if (wins.isNullOrEmpty()) {
@@ -180,8 +214,10 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             val editable = f != null && f.isEditable
             @Suppress("DEPRECATION") f?.recycle()
-            Log.d(TAG, "bubbleFocus mode=original(fallback) editable=$editable")
-            BubbleService.instance?.setInputAvailable(editable)
+            Log.d(TAG, "bubbleFocus mode=original(fallback) editable=$editable inputType=$inputType editorInputType=$editorInputType")
+            BubbleService.instance?.setInputAvailable(bubbleInputAvailable(
+                keyboardOnly = false, imeOpen = false, editable = editable, inputType = inputType, editorInputType = editorInputType,
+            ))
             return
         }
         var editable = false
@@ -202,8 +238,41 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             if (editable) break
         }
         if (ourModalActive) return
-        Log.d(TAG, "bubbleFocus mode=original editable=$editable ime=$imeOpen host=$lastHostPackage")
-        BubbleService.instance?.setInputAvailable(editable || imeOpen)
+        Log.d(TAG, "bubbleFocus mode=original editable=$editable ime=$imeOpen inputType=$inputType editorInputType=$editorInputType editorPackage=${editor?.packageName} host=$lastHostPackage")
+        BubbleService.instance?.setInputAvailable(bubbleInputAvailable(
+            keyboardOnly = false, imeOpen = imeOpen, editable = editable, inputType = inputType, editorInputType = editorInputType,
+        ))
+    }
+
+    /**
+     * Read the field's declared type, never its contents or the keyboard's layout.
+     * Only foreground application windows can veto visibility; background apps
+     * may retain focused numeric editors. Re-read on each check to avoid stale types.
+     */
+    private fun focusedHostInputType(wins: List<AccessibilityWindowInfo>?): Int? {
+        fun inputTypeIn(root: AccessibilityNodeInfo): Int? {
+            val pkg = root.packageName?.toString() ?: return null
+            if (!isHostPackage(pkg, packageName)) return null
+            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return null
+            return try { focused.inputType } finally {
+                @Suppress("DEPRECATION") focused.recycle()
+            }
+        }
+        for (window in wins.orEmpty().filter {
+            it.type == AccessibilityWindowInfo.TYPE_APPLICATION && (it.isFocused || it.isActive)
+        }.sortedByDescending { it.isFocused }) {
+            val root = window.root ?: continue
+            try {
+                inputTypeIn(root)?.let { return it }
+            } finally {
+                @Suppress("DEPRECATION") root.recycle()
+            }
+        }
+        // Some apps/devices expose active focus but no interactive window roots.
+        val root = rootInActiveWindow ?: return null
+        return try { inputTypeIn(root) } finally {
+            @Suppress("DEPRECATION") root.recycle()
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -225,8 +294,7 @@ class OpenWisprAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                main.removeCallbacks(keyboardCheck)
-                main.postDelayed(keyboardCheck, debounceMs)
+                scheduleBubbleCheck()
             }
         }
         if (pendingText == null) return
